@@ -1,0 +1,1 @@
+void razor_setup_log_ffi();

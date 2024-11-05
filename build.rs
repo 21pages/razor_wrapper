@@ -8,6 +8,8 @@ fn main() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let razor_dir = manifest_dir.join("razor");
     let mut builder = Build::new();
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=razor");
 
     // bbr
     let bbr_dir = razor_dir.join("bbr");
@@ -103,6 +105,11 @@ fn main() {
     builder.include(&remb_dir);
     builder.files(["remb_sender.c", "remb_receiver.c"].map(|f| remb_dir.join(f)));
 
+    // src
+    let src_dir = manifest_dir.join("src");
+    builder.include(&src_dir);
+    builder.files(["razor_ffi.c"].map(|f| src_dir.join(f)));
+
     #[cfg(windows)]
     builder.define("WIN32", None);
 
@@ -114,6 +121,7 @@ fn main() {
                 .to_string_lossy()
                 .to_string(),
         )
+        .header(src_dir.join("razor_ffi.h").to_string_lossy().to_string())
         .rustified_enum("*")
         .generate()
         .unwrap()

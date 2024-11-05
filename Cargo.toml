@@ -9,3 +9,6 @@ log = "0.4"
 [build-dependencies]
 cc = "1.0"
 bindgen = "0.59"
+
+[dev-dependencies]
+tokio = { version = "1.38", features = ["full"] }
