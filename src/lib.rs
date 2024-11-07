@@ -13,8 +13,17 @@ pub struct BitrateChange {
     pub rtt: u32,
 }
 
+#[derive(Debug)]
+pub struct PaceSendPacket {
+    pub packet_id: u32,
+    pub retrans: c_int,
+    pub size: size_t,
+    pub padding: c_int,
+}
+
 struct SenderOpaque {
     bitrate_change_tx: std::sync::mpsc::Sender<BitrateChange>,
+    // pace_send_tx: std::sync::mpsc::Sender<PaceSendPacket>,
 }
 
 pub struct Sender {
@@ -22,19 +31,28 @@ pub struct Sender {
     opaque: *mut SenderOpaque,
     packet_id_seed: u32,
     transport_seq: u16,
+    rtt: i32,
+    rtt_var: i32,
 }
+
+unsafe impl Send for Sender {}
+unsafe impl Sync for Sender {}
 
 impl Sender {
     pub fn new(
         r#type: _bindgen_ty_1,
         padding: c_int,
         bitrate_change_tx: std::sync::mpsc::Sender<BitrateChange>,
+        // pace_send_tx: std::sync::mpsc::Sender<PaceSendPacket>,
         queue_ms: c_int,
     ) -> Self {
         unsafe {
             razor_setup_log_ffi();
         }
-        let opaque = Box::into_raw(Box::new(SenderOpaque { bitrate_change_tx }));
+        let opaque = Box::into_raw(Box::new(SenderOpaque {
+            bitrate_change_tx,
+            // pace_send_tx,
+        }));
 
         let sender = unsafe {
             razor_sender_create(
@@ -52,6 +70,8 @@ impl Sender {
             opaque,
             packet_id_seed: 0,
             transport_seq: 0,
+            rtt: 100,
+            rtt_var: 5,
         }
     }
 
@@ -71,6 +91,25 @@ impl Sender {
             })
             .ok();
     }
+
+    // unsafe extern "C" fn send_callback(
+    //     handler: *mut ::std::os::raw::c_void,
+    //     packet_id: u32,
+    //     retrans: ::std::os::raw::c_int,
+    //     size: size_t,
+    //     padding: ::std::os::raw::c_int,
+    // ) {
+    //     let opaque = handler as *mut SenderOpaque;
+    //     (*opaque)
+    //         .pace_send_tx
+    //         .send(PaceSendPacket {
+    //             packet_id,
+    //             retrans,
+    //             size,
+    //             padding,
+    //         })
+    //         .ok();
+    // }
 
     pub fn heartbeat(&self) {
         unsafe {
@@ -114,9 +153,11 @@ impl Sender {
         }
     }
 
-    pub fn update_rtt(&self, rtt: i32) {
+    pub fn update_rtt(&mut self, rtt: i32) {
         unsafe {
             if let Some(update_rtt) = (*self.sender).update_rtt {
+                let rtt = calculate_rtt(&mut self.rtt, &mut self.rtt_var, rtt);
+                update_rtt(self.sender, self.rtt + self.rtt_var);
                 update_rtt(self.sender, rtt);
             }
         }
@@ -171,7 +212,13 @@ struct ReceiverOpaque {
 pub struct Receiver {
     receiver: *mut razor_receiver_t,
     opaque: *mut ReceiverOpaque,
+    transport_seq: u16,
+    rtt: i32,
+    rtt_var: i32,
 }
+
+unsafe impl Send for Receiver {}
+unsafe impl Sync for Receiver {}
 
 impl Receiver {
     pub fn new(
@@ -196,7 +243,13 @@ impl Receiver {
                 Some(Self::razor_receiver_send_feedback_callback),
             )
         };
-        Self { receiver, opaque }
+        Self {
+            receiver,
+            opaque,
+            transport_seq: 0,
+            rtt: 100,
+            rtt_var: 5,
+        }
     }
 
     unsafe extern "C" fn razor_receiver_send_feedback_callback(
@@ -205,12 +258,6 @@ impl Receiver {
         payload_size: c_int,
     ) {
         let opaque = handler as *mut ReceiverOpaque;
-        println!(
-            "razor_receiver_send_feedback_callback, payload_size: {}, payload is null: {}, is aligned: {}",
-            payload_size,
-            payload.is_null(),
-            payload.is_aligned()
-        );
         let feedback = std::slice::from_raw_parts(payload, payload_size as usize).to_vec();
         (*opaque).feedback_tx.send(feedback).ok();
     }
@@ -223,10 +270,15 @@ impl Receiver {
         }
     }
 
-    pub fn on_received(&self, transport_seq: u16, size: u64, remb: c_int) {
+    pub fn on_received(&mut self, size: u64, elapsed: u32) {
         unsafe {
             if let Some(on_received) = (*self.receiver).on_received {
-                on_received(self.receiver, transport_seq, get_time(), size, remb);
+                if self.transport_seq == u16::MAX {
+                    self.transport_seq = 0;
+                } else {
+                    self.transport_seq += 1;
+                }
+                on_received(self.receiver, self.transport_seq, elapsed, size, 1);
             }
         }
     }
@@ -247,10 +299,11 @@ impl Receiver {
         }
     }
 
-    pub fn update_rtt(&self, rtt: i32) {
+    pub fn update_rtt(&mut self, rtt: i32) {
         unsafe {
             if let Some(update_rtt) = (*self.receiver).update_rtt {
-                update_rtt(self.receiver, rtt);
+                calculate_rtt(&mut self.rtt, &mut self.rtt_var, rtt);
+                update_rtt(self.receiver, self.rtt + self.rtt_var);
             }
         }
     }
@@ -289,9 +342,15 @@ pub extern "C" fn razor_log_to_rust(
 }
 
 #[inline]
-pub fn get_time() -> u32 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0) as _
+fn calculate_rtt(rtt: &mut i32, rtt_var: &mut i32, keep_rtt: i32) -> i32 {
+    let keep_rtt = keep_rtt.max(5);
+    *rtt_var = (*rtt_var * 3 + (*rtt as i32 - keep_rtt as i32).abs()) / 4;
+    if *rtt_var < 10 {
+        *rtt_var = 10;
+    }
+    *rtt = (7 * *rtt + keep_rtt) / 8;
+    if *rtt < 10 {
+        *rtt = 10;
+    }
+    keep_rtt
 }
